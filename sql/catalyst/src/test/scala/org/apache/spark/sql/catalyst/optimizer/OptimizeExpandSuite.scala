@@ -19,7 +19,7 @@ package org.apache.spark.sql.catalyst.optimizer
 
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
-import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.expressions.{Attribute, Literal}
 import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
@@ -159,6 +159,39 @@ class OptimizeExpandSuite extends PlanTest {
         "Pre-aggregate should include distinct col1")
       assert(groupByNames.contains("col2"),
         "Pre-aggregate should include distinct col2")
+    }
+  }
+
+  test("SPARK-58888: skips when the pre-aggregate group-by would be empty") {
+    withSQLConf(SQLConf.OPTIMIZE_EXPAND_RATIO.key -> "2") {
+      // With no grouping key and every distinct child foldable, the Expand references
+      // no attribute, so the pre-aggregate would be Aggregate(Nil, Nil, child) -- a
+      // global aggregate, which returns a row even for an empty child.
+      val query = testRelation
+        .groupBy()(
+          countDistinct(Literal(1)).as("cd1"),
+          countDistinct(Literal(2)).as("cd2"))
+        .analyze
+      val optimized = Optimize.execute(query)
+      assert(optimized.exists(_.isInstanceOf[Expand]),
+        "The rewrite should still produce an Expand, otherwise this asserts nothing")
+      assert(!hasPreAggBeforeExpand(optimized),
+        "Should skip when the pre-aggregate would have an empty group-by")
+    }
+  }
+
+  test("SPARK-58888: applies when only some distinct children are foldable") {
+    withSQLConf(SQLConf.OPTIMIZE_EXPAND_RATIO.key -> "2") {
+      // col1 keeps the pre-aggregate's group-by non-empty, so it stays a grouping
+      // aggregate.
+      val query = testRelation
+        .groupBy()(
+          countDistinct(Literal(1)).as("cd1"),
+          countDistinct($"col1").as("cd2"))
+        .analyze
+      val optimized = Optimize.execute(query)
+      assert(hasPreAggBeforeExpand(optimized),
+        "Should still apply when at least one distinct child is an attribute")
     }
   }
 

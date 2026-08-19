@@ -43,10 +43,15 @@ import org.apache.spark.sql.internal.SQLConf
  *  - No non-distinct aggregates or FILTER clauses on distinct
  *    aggregates (checked via `expand.producedAttributes` being
  *    a subset of the inner aggregate's GROUP BY)
- *  - The pre-aggregate's group-by column count does not exceed
- *    the inner aggregate's (minus gid), which rejects composite
- *    distinct expressions (e.g. `col1 + col2`) that introduce
- *    extra leaf attributes and inflate the Cartesian product.
+ *  - The pre-aggregate's group-by is non-empty. An empty one would
+ *    make it a global aggregate, which emits a row where its child
+ *    had none.
+ *  - The pre-aggregate's group-by column count does not exceed the
+ *    inner aggregate's (minus gid). It can only group by leaf
+ *    attributes, and a distinct expression over several columns
+ *    (e.g. `col1 + col2`) contributes one each, so past that budget
+ *    the pre-aggregate yields at least as many groups as the
+ *    distinct expressions themselves and removes no more rows.
  *  - The Expand child is not already an Aggregate (idempotency)
  *
  * Controlled by `spark.sql.optimizer.optimizeExpandRatio`
@@ -87,11 +92,14 @@ object OptimizeExpand extends Rule[LogicalPlan] {
    *     (gid present in inner GROUP BY).
    *  2. All Expand-produced attributes are consumed by the inner
    *     GROUP BY (rejects non-distinct aggs and FILTER clauses).
-   *  3. The pre-aggregate's group-by column count does not exceed
-   *     the inner aggregate's (minus gid). Composite distinct
-   *     expressions like `col1 + col2` fan out into more leaf
-   *     attributes, inflating the Cartesian product and making
-   *     pre-aggregation counterproductive.
+   *  3. The pre-aggregate's group-by is non-empty and no wider than
+   *     the inner aggregate's (minus gid). Empty makes it a global
+   *     aggregate, emitting a row where its child had none. The upper
+   *     bound budgets the leaf attributes it would group by, which a
+   *     distinct expression over several columns such as `col1 + col2`
+   *     can exhaust; past it the pre-aggregate yields at least as many
+   *     groups as the distinct expressions themselves and removes no
+   *     more rows.
    */
   private def canOptimize(
       innerAgg: Aggregate,
@@ -107,12 +115,20 @@ object OptimizeExpand extends Rule[LogicalPlan] {
       innerAgg.groupingExpressions.flatMap(_.references))
     if (!expand.producedAttributes.subsetOf(innerGroupByAttrs)) return false
 
-    // Check 3: composite expressions like col1 + col2 fan out into
-    // more leaf attributes than inner group-by slots, making the
-    // pre-aggregate's Cartesian product too large for effective dedup.
-    val preAggSize = expand.child.output.count(expand.references.contains)
+    // Check 3: the pre-aggregate's group-by must be non-empty, and no wider than the
+    // inner aggregate's (minus gid).
+    //
+    // A group-by-less aggregate emits a row for an empty child, and
+    // PropagateEmptyRelation skips group-by-less aggregates, so emptiness stops
+    // propagating there as well: counting distinct constants over an empty relation
+    // returns 1 instead of 0 (SPARK-58888). The upper bound is a budget on the leaf
+    // attributes the pre-aggregate would group by, which a distinct expression over
+    // several columns such as col1 + col2 can exhaust; past it the pre-aggregate
+    // yields at least as many groups as the distinct expressions themselves, so it
+    // removes no more rows.
+    val preAggGroupBy = collectPreAggGroupBy(expand)
     val innerGroupBySize = innerAgg.groupingExpressions.size - 1 // minus gid
-    preAggSize <= innerGroupBySize
+    preAggGroupBy.nonEmpty && preAggGroupBy.size <= innerGroupBySize
   }
 
   /**

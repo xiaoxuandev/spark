@@ -211,4 +211,87 @@ class OptimizeExpandQuerySuite extends SharedSparkSession {
       }
     }
   }
+
+  test("SPARK-58888: empty input with all distinct children foldable") {
+    withTempView("events") {
+      spark.sql("SELECT * FROM VALUES (1) AS t(id) WHERE 1 = 0")
+        .createOrReplaceTempView("events")
+
+      // The first query has no literal distinct argument: FoldablePropagation folds the
+      // constant projection through, which is how tagging a constant dimension in a
+      // subquery or view reaches the same state as the second.
+      Seq(
+        """SELECT count(distinct region), count(distinct channel)
+          |FROM (SELECT 'US' AS region, 'web' AS channel, id FROM events)""".stripMargin,
+        "SELECT count(distinct 1), count(distinct 2) FROM events"
+      ).foreach { sqlText =>
+        val expected = withSQLConf(SQLConf.OPTIMIZE_EXPAND_RATIO.key -> "-1") {
+          spark.sql(sqlText).collect().toSeq
+        }
+        assert(expected.size == 1 && expected.head.toSeq.forall(_ == 0L),
+          s"empty input should produce a single row of zeros: $sqlText")
+
+        withSQLConf(SQLConf.OPTIMIZE_EXPAND_RATIO.key -> "2") {
+          val df = spark.sql(sqlText)
+          checkAnswer(df, expected)
+          // Look for the offending node itself rather than for an Aggregate under the
+          // Expand: with the pre-aggregate gone PropagateEmptyRelation collapses the
+          // Expand as well, so an Expand-based probe would pass for want of an Expand.
+          assert(!df.queryExecution.optimizedPlan.exists {
+            case a: Aggregate =>
+              a.groupingExpressions.isEmpty && a.aggregateExpressions.isEmpty
+            case _ => false
+          }, s"Should not insert a group-by-nothing pre-aggregate: $sqlText")
+        }
+      }
+
+      // With a constant GROUP BY the invented row is an invented group: an empty input
+      // has no groups, so the correct answer is no rows at all.
+      withSQLConf(SQLConf.OPTIMIZE_EXPAND_RATIO.key -> "2") {
+        checkAnswer(
+          spark.sql("SELECT count(distinct 1), count(distinct 2) FROM events GROUP BY 'x'"),
+          Seq.empty[Row])
+      }
+    }
+  }
+
+  test("SPARK-58888: input that is only empty at runtime") {
+    withTempView("events") {
+      // The filter cannot be evaluated at optimization time, so the plan holds no empty
+      // LocalRelation and PropagateEmptyRelation cannot correct the result either way.
+      spark.range(5).where("id > 1000").createOrReplaceTempView("events")
+
+      withSQLConf(SQLConf.OPTIMIZE_EXPAND_RATIO.key -> "2") {
+        checkAnswer(
+          spark.sql("SELECT count(distinct 1), count(distinct 2) FROM events"),
+          Seq(Row(0L, 0L)))
+
+        // With one real column the rewrite still applies, and the grouping pre-aggregate
+        // it inserts passes an empty input through.
+        val df = spark.sql("SELECT count(distinct 1), count(distinct id) FROM events")
+        checkAnswer(df, Seq(Row(0L, 0L)))
+        assert(df.queryExecution.optimizedPlan.collect {
+          case e: Expand => e.child.isInstanceOf[Aggregate]
+        }.exists(identity), "The rewrite should still apply for an attribute distinct child")
+      }
+    }
+  }
+
+  test("SPARK-58888: still applies when a distinct child is an attribute") {
+    withTempView("events") {
+      spark.sql("SELECT * FROM VALUES (1), (1), (2) AS t(k)")
+        .createOrReplaceTempView("events")
+
+      // k keeps the pre-aggregate's group-by non-empty, so it stays a grouping aggregate.
+      val sqlText = "SELECT count(distinct 1), count(distinct k) FROM events"
+      withSQLConf(SQLConf.OPTIMIZE_EXPAND_RATIO.key -> "2") {
+        val df = spark.sql(sqlText)
+        checkAnswer(df, Seq(Row(1L, 2L)))
+        assert(df.queryExecution.optimizedPlan.collect {
+          case e: Expand => e.child.isInstanceOf[Aggregate]
+        }.exists(identity),
+          "Should still apply when at least one distinct child is an attribute")
+      }
+    }
+  }
 }
